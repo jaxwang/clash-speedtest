@@ -1,70 +1,78 @@
 package main
 
 import (
-	"context"
-	"encoding/csv"
 	"flag"
 	"fmt"
-	"io"
+	"os"
+	"sort"
+	"time"
+	"strings"
 	"net"
 	"net/http"
-	"os"
-	"regexp"
-	"sort"
+	"context"
 	"strconv"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 	"encoding/json"
-	"math/rand"
 	"errors"
+	"math/rand"
 
-	"github.com/Dreamacro/clash/adapter"
-	"github.com/Dreamacro/clash/adapter/provider"
-	C "github.com/Dreamacro/clash/constant"
-	"github.com/Dreamacro/clash/log"
+	"github.com/faceair/clash-speedtest/speedtester"
+	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/constant"
+	"github.com/olekukonko/tablewriter"
+	"github.com/schollz/progressbar/v3"
 	"gopkg.in/yaml.v3"
 )
 
 var (
-	livenessObject     = flag.String("l", "https://speed.cloudflare.com/__down?bytes=%d", "liveness object, support http(s) url, support payload too")
-	configPathConfig   = flag.String("c", "", "configuration file path, also support http(s) url")
-	filterRegexConfig  = flag.String("f", ".*", "filter proxies by name, use regexp")
-	downloadSizeConfig = flag.Int("size", 1024*1024*100, "download size for testing proxies")
-	timeoutConfig      = flag.Duration("timeout", time.Second*5, "timeout for testing proxies")
-	sortField          = flag.String("sort", "b", "sort field for testing proxies, b for bandwidth, t for TTFB")
-	output             = flag.String("output", "", "output result to csv/yaml file")
-	concurrent         = flag.Int("concurrent", 4, "download concurrent size")
-	ipTokenList 	   = flag.String("iptokens", "", "comma-separated list of ipinfo.io tokens")
-
+	configPathsConfig = flag.String("c", "", "config file path, also support http(s) url")
+	filterRegexConfig = flag.String("f", ".+", "filter proxies by name, use regexp")
+	serverURL         = flag.String("server-url", "https://speed.cloudflare.com", "server url")
+	downloadSize      = flag.Int("download-size", 50*1024*1024, "download size for testing proxies")
+	uploadSize        = flag.Int("upload-size", 20*1024*1024, "upload size for testing proxies")
+	timeout           = flag.Duration("timeout", time.Second*5, "timeout for testing proxies")
+	concurrent        = flag.Int("concurrent", 4, "download concurrent size")
+	outputPath        = flag.String("output", "", "output config file path")
+	maxLatency        = flag.Duration("max-latency", 800*time.Millisecond, "filter latency greater than this value")
+	minSpeed          = flag.Float64("min-speed", 5, "filter speed less than this value(unit: MB/s)")
+	ipTokenList       = flag.String("iptokens", "", "comma-separated list of ipinfo.io tokens")
 )
 
-type CProxy struct {
-	C.Proxy
-	SecretConfig any
-}
-
-type Result struct {
-	Name      string
-	Bandwidth float64
-	TTFB      time.Duration
-	CountryCode	string
-	IP		  string
-}
-
-var (
-	red   = "\033[31m"
-	green = "\033[32m"
+const (
+	colorRed    = "\033[31m"
+	colorGreen  = "\033[32m"
+	colorYellow = "\033[33m"
+	colorReset  = "\033[0m"
 )
 
-type RawConfig struct {
-	Providers map[string]map[string]any `yaml:"proxy-providers"`
-	Proxies   []map[string]any          `yaml:"proxies"`
+// ExtendedResult 扩展的结果结构，包含国家代码和IP信息
+type ExtendedResult struct {
+	speedtester.Result
+	CountryCode string
+	IP          string
 }
 
 func main() {
 	flag.Parse()
+	log.SetLevel(log.SILENT)
+
+	if *configPathsConfig == "" {
+		log.Fatalln("please specify the configuration file")
+	}
+
+	speedTester := speedtester.New(&speedtester.Config{
+		ConfigPaths:  *configPathsConfig,
+		FilterRegex:  *filterRegexConfig,
+		ServerURL:    *serverURL,
+		DownloadSize: *downloadSize,
+		UploadSize:   *uploadSize,
+		Timeout:      *timeout,
+		Concurrent:   *concurrent,
+	})
+
+	allProxies, err := speedTester.LoadProxies()
+	if err != nil {
+		log.Fatalln("load proxies failed: %v", err)
+	}
 
 	// 解析并分割字符串
 	ipTokenArray := strings.Split(*ipTokenList, ",")
@@ -74,157 +82,186 @@ func main() {
 		ipTokenArray = append(ipTokenArray, "")
 	}
 
-	C.UA = "clash.meta"
-
-	if *configPathConfig == "" {
-		log.Fatalln("Please specify the configuration file")
-	}
-
-	var allProxies = make(map[string]CProxy)
-	for _, configPath := range strings.Split(*configPathConfig, ",") {
-		var body []byte
-		var err error
-		if strings.HasPrefix(configPath, "http") {
-			var resp *http.Response
-			resp, err = http.Get(configPath)
-			if err != nil {
-				log.Warnln("failed to fetch config: %s", err)
-				continue
+	bar := progressbar.Default(int64(len(allProxies)), "测试中...")
+	results := make([]*ExtendedResult, 0)
+	
+	// 使用 speedtester 的 TestProxies 方法进行测试
+	speedTester.TestProxies(allProxies, func(result *speedtester.Result) {
+		extendedResult := &ExtendedResult{
+			Result: *result,
+		}
+		
+		// 添加获取country_code和IP的逻辑
+		const epsilon = 1e-9 // 一个很小的值
+		if result.DownloadSpeed > epsilon {
+			proxy := allProxies[result.ProxyName]
+			if proxy != nil {
+				countryCode, ip, err := queryIPLocation(result.ProxyName, proxy.Proxy, *timeout*2, ipTokenArray)
+				if err == nil {
+					extendedResult.CountryCode = countryCode
+					extendedResult.IP = ip
+				}
 			}
-			body, err = io.ReadAll(resp.Body)
+		}
+		
+		bar.Add(1)
+		bar.Describe(result.ProxyName)
+		results = append(results, extendedResult)
+	})
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].DownloadSpeed > results[j].DownloadSpeed
+	})
+
+	printResults(results)
+
+	if *outputPath != "" {
+		err = saveConfig(results)
+		if err != nil {
+			log.Fatalln("save config file failed: %v", err)
+		}
+		fmt.Printf("\nsave config file to: %s\n", *outputPath)
+	}
+}
+
+func printResults(results []*ExtendedResult) {
+	table := tablewriter.NewWriter(os.Stdout)
+
+	table.SetHeader([]string{
+		"序号",
+		"节点名称",
+		"类型",
+		"延迟",
+		"抖动",
+		"丢包率",
+		"下载速度",
+		"上传速度",
+		"国家代码",
+		"IP",
+	})
+
+	table.SetAutoWrapText(false)
+	table.SetAutoFormatHeaders(true)
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetCenterSeparator("")
+	table.SetColumnSeparator("")
+	table.SetRowSeparator("")
+	table.SetHeaderLine(false)
+	table.SetBorder(false)
+	table.SetTablePadding("\t")
+	table.SetNoWhiteSpace(true)
+
+	for i, result := range results {
+		idStr := fmt.Sprintf("%d.", i+1)
+
+		// 延迟颜色
+		latencyStr := result.FormatLatency()
+		if result.Latency > 0 {
+			if result.Latency < 800*time.Millisecond {
+				latencyStr = colorGreen + latencyStr + colorReset
+			} else if result.Latency < 1500*time.Millisecond {
+				latencyStr = colorYellow + latencyStr + colorReset
+			} else {
+				latencyStr = colorRed + latencyStr + colorReset
+			}
 		} else {
-			body, err = os.ReadFile(configPath)
-		}
-		if err != nil {
-			log.Warnln("failed to read config: %s", err)
-			continue
+			latencyStr = colorRed + latencyStr + colorReset
 		}
 
-		lps, err := loadProxies(body)
-		if err != nil {
-			log.Fatalln("Failed to convert : %s", err)
-		}
-
-		for k, p := range lps {
-			if _, ok := allProxies[k]; !ok {
-				allProxies[k] = p
+		jitterStr := result.FormatJitter()
+		if result.Jitter > 0 {
+			if result.Jitter < 800*time.Millisecond {
+				jitterStr = colorGreen + jitterStr + colorReset
+			} else if result.Jitter < 1500*time.Millisecond {
+				jitterStr = colorYellow + jitterStr + colorReset
+			} else {
+				jitterStr = colorRed + jitterStr + colorReset
 			}
+		} else {
+			jitterStr = colorRed + jitterStr + colorReset
 		}
+
+		// 丢包率颜色
+		packetLossStr := result.FormatPacketLoss()
+		if result.PacketLoss < 10 {
+			packetLossStr = colorGreen + packetLossStr + colorReset
+		} else if result.PacketLoss < 20 {
+			packetLossStr = colorYellow + packetLossStr + colorReset
+		} else {
+			packetLossStr = colorRed + packetLossStr + colorReset
+		}
+
+		// 下载速度颜色 (以MB/s为单位判断)
+		downloadSpeed := result.DownloadSpeed / (1024 * 1024)
+		downloadSpeedStr := result.FormatDownloadSpeed()
+		if downloadSpeed >= 10 {
+			downloadSpeedStr = colorGreen + downloadSpeedStr + colorReset
+		} else if downloadSpeed >= 5 {
+			downloadSpeedStr = colorYellow + downloadSpeedStr + colorReset
+		} else {
+			downloadSpeedStr = colorRed + downloadSpeedStr + colorReset
+		}
+
+		// 上传速度颜色
+		uploadSpeed := result.UploadSpeed / (1024 * 1024)
+		uploadSpeedStr := result.FormatUploadSpeed()
+		if uploadSpeed >= 5 {
+			uploadSpeedStr = colorGreen + uploadSpeedStr + colorReset
+		} else if uploadSpeed >= 2 {
+			uploadSpeedStr = colorYellow + uploadSpeedStr + colorReset
+		} else {
+			uploadSpeedStr = colorRed + uploadSpeedStr + colorReset
+		}
+
+		row := []string{
+			idStr,
+			result.ProxyName,
+			result.ProxyType,
+			latencyStr,
+			jitterStr,
+			packetLossStr,
+			downloadSpeedStr,
+			uploadSpeedStr,
+			result.CountryCode,
+			result.IP,
+		}
+
+		table.Append(row)
 	}
 
-	filteredProxies := filterProxies(*filterRegexConfig, allProxies)
-	results := make([]Result, 0, len(filteredProxies))
+	fmt.Println()
+	table.Render()
+	fmt.Println()
+}
 
-	//format := "%s%-42s\t%-12s\t%-12s\033[0m\n"
-	format := "%s%-42s\t%-12s\t%-12s\t%-9s\t%-15s\033[0m\n"
-
-	fmt.Printf(format, "", "节点", "带宽", "延迟", "国家代码", "IP")
-	for _, name := range filteredProxies {
-		proxy := allProxies[name]
-		switch proxy.Type() {
-		case C.Shadowsocks, C.ShadowsocksR, C.Snell, C.Socks5, C.Http, C.Vmess, C.Vless, C.Trojan, C.Hysteria, C.Hysteria2, C.WireGuard, C.Tuic:
-			result := TestProxyConcurrent(name, proxy, *downloadSizeConfig, *timeoutConfig, *concurrent , ipTokenArray)
-			result.Printf(format)
-			results = append(results, *result)
-		case C.Direct, C.Reject, C.Relay, C.Selector, C.Fallback, C.URLTest, C.LoadBalance:
+func saveConfig(results []*ExtendedResult) error {
+	filteredResults := make([]*ExtendedResult, 0)
+	for _, result := range results {
+		if *maxLatency > 0 && result.Latency > *maxLatency {
 			continue
-		default:
-			log.Fatalln("Unsupported proxy type: %s", proxy.Type())
 		}
+		if *minSpeed > 0 && float64(result.DownloadSpeed)/(1024*1024) < *minSpeed {
+			continue
+		}
+		filteredResults = append(filteredResults, result)
 	}
 
-	if *sortField != "" {
-		switch *sortField {
-		case "b", "bandwidth":
-			sort.Slice(results, func(i, j int) bool {
-				return results[i].Bandwidth > results[j].Bandwidth
-			})
-			fmt.Println("\n\n===结果按照带宽排序===")
-		case "t", "ttfb":
-			sort.Slice(results, func(i, j int) bool {
-				return results[i].TTFB < results[j].TTFB
-			})
-			fmt.Println("\n\n===结果按照延迟排序===")
-		default:
-			log.Fatalln("Unsupported sort field: %s", *sortField)
-		}
-		fmt.Printf(format, "", "节点", "带宽", "延迟", "国家代码", "IP")
-		for _, result := range results {
-			result.Printf(format)
-		}
+	proxies := make([]map[string]any, 0)
+	for _, result := range filteredResults {
+		proxies = append(proxies, result.ProxyConfig)
 	}
 
-	if strings.EqualFold(*output, "yaml") {
-		if err := writeNodeConfigurationToYAML("result.yaml", results, allProxies); err != nil {
-			log.Fatalln("Failed to write yaml: %s", err)
-		}
-	} else if strings.EqualFold(*output, "csv") {
-		if err := writeToCSV("result.csv", results); err != nil {
-			log.Fatalln("Failed to write csv: %s", err)
-		}
+	config := &speedtester.RawConfig{
+		Proxies: proxies,
 	}
-}
+	
+	yamlData, err := yaml.Marshal(config)
+	if err != nil {
+		return err
+	}
 
-func filterProxies(filter string, proxies map[string]CProxy) []string {
-	filterRegexp := regexp.MustCompile(filter)
-	filteredProxies := make([]string, 0, len(proxies))
-	for name := range proxies {
-		if filterRegexp.MatchString(name) {
-			filteredProxies = append(filteredProxies, name)
-		}
-	}
-	sort.Strings(filteredProxies)
-	return filteredProxies
-}
-
-func loadProxies(buf []byte) (map[string]CProxy, error) {
-	rawCfg := &RawConfig{
-		Proxies: []map[string]any{},
-	}
-	if err := yaml.Unmarshal(buf, rawCfg); err != nil {
-		return nil, err
-	}
-	proxies := make(map[string]CProxy)
-	proxiesConfig := rawCfg.Proxies
-	providersConfig := rawCfg.Providers
-
-	for i, config := range proxiesConfig {
-		proxy, err := adapter.ParseProxy(config)
-		if err != nil {
-			return nil, fmt.Errorf("proxy %d: %w", i, err)
-		}
-
-		if _, exist := proxies[proxy.Name()]; exist {
-			return nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
-		}
-		proxies[proxy.Name()] = CProxy{Proxy: proxy, SecretConfig: config}
-	}
-	for name, config := range providersConfig {
-		if name == provider.ReservedName {
-			return nil, fmt.Errorf("can not defined a provider called `%s`", provider.ReservedName)
-		}
-		pd, err := provider.ParseProxyProvider(name, config)
-		if err != nil {
-			return nil, fmt.Errorf("parse proxy provider %s error: %w", name, err)
-		}
-		if err := pd.Initial(); err != nil {
-			return nil, fmt.Errorf("initial proxy provider %s error: %w", pd.Name(), err)
-		}
-		for _, proxy := range pd.Proxies() {
-			proxies[fmt.Sprintf("[%s] %s", name, proxy.Name())] = CProxy{Proxy: proxy}
-		}
-	}
-	return proxies, nil
-}
-
-func (r *Result) Printf(format string) {
-	color := ""
-	if r.Bandwidth < 1024*1024 {
-		color = red
-	} else if r.Bandwidth > 1024*1024*10 {
-		color = green
-	}
-	fmt.Printf(format, color, formatName(r.Name), formatBandwidth(r.Bandwidth), formatMilliseconds(r.TTFB), r.CountryCode,r.IP)
+	return os.WriteFile(*outputPath, yamlData, 0o644)
 }
 
 // 返回随机 User-Agent 的函数 有些获取ip的api需要设置UA
@@ -253,24 +290,21 @@ func getRandomUserAgent() string {
 }
 
 func checkCountry(result map[string]interface{}, ip_url string) (string, string, bool) {
-
 	if ip, ok := result["ip"].(string); ok && ip != "" {
 		// 优先尝试获取 country_code 字段
 		if country, ok := result["country_code"].(string); ok && country != "" {
 			return country, ip, true
-
-		}else if country, ok := result["country"].(string); ok && country != "" { // 再次尝试获取 country 字段
+		} else if country, ok := result["country"].(string); ok && country != "" { // 再次尝试获取 country 字段
 			return country, ip, true
-		}else{
+		} else {
 			return "", ip, true
 		}
-	}else{
+	} else {
 		return "", "", false
 	}
 }
 
-func queryIPLocation(name string, proxy C.Proxy,timeout time.Duration,ipTokenArray []string) (string , string , error){
-
+func queryIPLocation(name string, proxy constant.Proxy, timeout time.Duration, ipTokenArray []string) (string, string, error) {
 	client := http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
@@ -283,7 +317,7 @@ func queryIPLocation(name string, proxy C.Proxy,timeout time.Duration,ipTokenArr
 				if port, err := strconv.ParseUint(port, 10, 16); err == nil {
 					u16Port = uint16(port)
 				}
-				return proxy.DialContext(ctx, &C.Metadata{
+				return proxy.DialContext(ctx, &constant.Metadata{
 					Host:    host,
 					DstPort: u16Port,
 				})
@@ -298,7 +332,7 @@ func queryIPLocation(name string, proxy C.Proxy,timeout time.Duration,ipTokenArr
 	//randomIndex := rand.Intn(len(ipTokenArray))
 
 	for _, token := range ipTokenArray {
-        apiURLs = append(apiURLs,fmt.Sprintf("http://ipinfo.io/json?token=%s", token))
+        apiURLs = append(apiURLs, fmt.Sprintf("http://ipinfo.io/json?token=%s", token))
     }
 
 	// 随机打乱数组 , 做api的负载均衡
@@ -311,7 +345,6 @@ func queryIPLocation(name string, proxy C.Proxy,timeout time.Duration,ipTokenArr
 
 	// 依次尝试每个 API
 	for _, ip_url := range apiURLs {
-
 		var result map[string]interface{}
 		// 创建请求
 		req, err := http.NewRequest("GET", ip_url, nil)
@@ -348,7 +381,7 @@ func queryIPLocation(name string, proxy C.Proxy,timeout time.Duration,ipTokenArr
 		if country_code, ip, ok := checkCountry(result, ip_url); ok {
 			//fmt.Println(ip_url)
 			//fmt.Printf("%+v\n", result)
-			return country_code , ip, nil
+			return country_code, ip, nil
 		} else {
 			//fmt.Printf("Invalid data from %s: %+v\n", ip_url, result)
 			continue
@@ -356,192 +389,4 @@ func queryIPLocation(name string, proxy C.Proxy,timeout time.Duration,ipTokenArr
 	}
 	// 如果所有 API 都失败，返回错误
 	return "", "", errors.New("all APIs failed or returned invalid data")
-}
-
-
-func TestProxyConcurrent(name string, proxy C.Proxy, downloadSize int, timeout time.Duration, concurrentCount int, ipTokenArray []string) *Result {
-	if concurrentCount <= 0 {
-		concurrentCount = 1
-	}
-
-	chunkSize := downloadSize / concurrentCount
-	totalTTFB := int64(0)
-	downloaded := int64(0)
-
-	var wg sync.WaitGroup
-	start := time.Now()
-	for i := 0; i < concurrentCount; i++ {
-		wg.Add(1)
-		go func(i int) {
-			result, w := TestProxy(name, proxy, chunkSize, timeout)
-			if w != 0 {
-				atomic.AddInt64(&downloaded, w)
-				atomic.AddInt64(&totalTTFB, int64(result.TTFB))
-			}
-			wg.Done()
-		}(i)
-	}
-	wg.Wait()
-	downloadTime := time.Since(start)
-
-	result := &Result{
-		Name:      name,
-		Bandwidth: float64(downloaded) / downloadTime.Seconds(),
-		TTFB:      time.Duration(totalTTFB / int64(concurrentCount)),
-		CountryCode: "NIL", //新增
-		IP:			"NIL", //新增
-	}
-
-	// 添加获取country_code 逻辑
-	const epsilon = 1e-9 // 一个很小的值
-	if result.Bandwidth > epsilon {
-		country_code, ip, err := queryIPLocation(name, proxy, timeout*2, ipTokenArray)
-		if err == nil {
-			if country_code != "" {
-				result.CountryCode = country_code
-			}
-			result.IP = ip
-		}
-	}
-
-	return result
-}
-
-func TestProxy(name string, proxy C.Proxy, downloadSize int, timeout time.Duration) (*Result, int64) {
-	client := http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				host, port, err := net.SplitHostPort(addr)
-				if err != nil {
-					return nil, err
-				}
-				var u16Port uint16
-				if port, err := strconv.ParseUint(port, 10, 16); err == nil {
-					u16Port = uint16(port)
-				}
-				return proxy.DialContext(ctx, &C.Metadata{
-					Host:    host,
-					DstPort: u16Port,
-				})
-			},
-		},
-	}
-
-	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf(*livenessObject, downloadSize))
-	if err != nil {
-		return &Result{name, -1, -1, "", ""}, 0
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode-http.StatusOK > 100 {
-		return &Result{name, -1, -1, "", ""}, 0
-	}
-	ttfb := time.Since(start)
-
-	written, _ := io.Copy(io.Discard, resp.Body)
-	if written == 0 {
-		return &Result{name, -1, -1, "", ""}, 0
-	}
-
-	downloadTime := time.Since(start) - ttfb
-	bandwidth := float64(written) / downloadTime.Seconds()
-
-	return &Result{name, bandwidth, ttfb, "", ""}, written
-}
-
-var (
-	emojiRegex = regexp.MustCompile(`[\x{1F600}-\x{1F64F}\x{1F300}-\x{1F5FF}\x{1F680}-\x{1F6FF}\x{2600}-\x{26FF}\x{1F1E0}-\x{1F1FF}]`)
-	spaceRegex = regexp.MustCompile(`\s{2,}`)
-)
-
-func formatName(name string) string {
-	noEmoji := emojiRegex.ReplaceAllString(name, "")
-	mergedSpaces := spaceRegex.ReplaceAllString(noEmoji, " ")
-	return strings.TrimSpace(mergedSpaces)
-}
-
-func formatBandwidth(v float64) string {
-	if v <= 0 {
-		return "N/A"
-	}
-	if v < 1024 {
-		return fmt.Sprintf("%.02fB/s", v)
-	}
-	v /= 1024
-	if v < 1024 {
-		return fmt.Sprintf("%.02fKB/s", v)
-	}
-	v /= 1024
-	if v < 1024 {
-		return fmt.Sprintf("%.02fMB/s", v)
-	}
-	v /= 1024
-	if v < 1024 {
-		return fmt.Sprintf("%.02fGB/s", v)
-	}
-	v /= 1024
-	return fmt.Sprintf("%.02fTB/s", v)
-}
-
-func formatMilliseconds(v time.Duration) string {
-	if v <= 0 {
-		return "N/A"
-	}
-	return fmt.Sprintf("%.02fms", float64(v.Milliseconds()))
-}
-
-func writeNodeConfigurationToYAML(filePath string, results []Result, proxies map[string]CProxy) error {
-	fp, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer fp.Close()
-
-	var sortedProxies []any
-	for _, result := range results {
-		if v, ok := proxies[result.Name]; ok {
-			sortedProxies = append(sortedProxies, v.SecretConfig)
-		}
-	}
-
-	bytes, err := yaml.Marshal(sortedProxies)
-	if err != nil {
-		return err
-	}
-
-	_, err = fp.Write(bytes)
-	return err
-}
-
-func writeToCSV(filePath string, results []Result) error {
-	csvFile, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer csvFile.Close()
-
-	// 写入 UTF-8 BOM 头
-	csvFile.WriteString("\xEF\xBB\xBF")
-
-	csvWriter := csv.NewWriter(csvFile)
-	err = csvWriter.Write([]string{"节点", "带宽 (MB/s)", "延迟 (ms)", "国家代码", "IP"})
-	if err != nil {
-		return err
-	}
-	for _, result := range results {
-		line := []string{
-			result.Name,
-			fmt.Sprintf("%.2f", result.Bandwidth/1024/1024),
-			strconv.FormatInt(result.TTFB.Milliseconds(), 10),
-			result.CountryCode,
-			result.IP,
-		}
-		err = csvWriter.Write(line)
-		if err != nil {
-			return err
-		}
-	}
-	csvWriter.Flush()
-	return nil
 }

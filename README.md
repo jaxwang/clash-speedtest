@@ -23,6 +23,8 @@ Usage of clash-speedtest:
         configuration file path, also support http(s) url
   -f string
         filter proxies by name, use regexp (default ".*")
+  -b string
+        block proxies by keywords, use | to separate multiple keywords (example: -b 'rate|x1|1x')
   -server-url string
         server url for testing proxies (default "https://speed.cloudflare.com")
   -download-size int
@@ -35,10 +37,18 @@ Usage of clash-speedtest:
         download concurrent size (default 4)
   -output string
         output config file path (default "")
+  -stash-compatible
+        enable stash compatible mode
   -max-latency duration
         filter latency greater than this value (default 800ms)
-  -min-speed float
+  -min-download-speed float
         filter speed less than this value(unit: MB/s) (default 5)
+  -min-upload-speed float
+        filter upload speed less than this value(unit: MB/s) (default 2)
+  -rename
+        rename nodes with IP location and speed
+  -fast
+        enable fast mode, only test latency
 
 # 演示：
 
@@ -61,7 +71,25 @@ Premium|广港|IEPL|05                        	3.87MB/s    	249.00ms
 # 4. 筛选出延迟低于 800ms 且下载速度大于 5MB/s 的节点，并输出到 filtered.yaml
 > clash-speedtest -c "https://domain.com/api/v1/client/subscribe?token=secret&flag=meta" -output filtered.yaml -max-latency 800ms -min-speed 5
 # 筛选后的配置文件可以直接粘贴到 Clash/Mihomo 中使用，或是贴到 Github\Gist 上通过 Proxy Provider 引用。
-```
+
+# 5. 使用 -rename 选项按照 IP 地区和下载速度重命名节点
+> clash-speedtest -c config.yaml -output result.yaml -rename
+# 重命名后的节点名称格式：🇺🇸 US | ⬇️ 15.67 MB/s
+# 包含国旗 emoji、国家代码和下载速度
+
+# 6. 快速测试模式
+> clash-speedtest -f 'HK' -fast -c ~/.config/clash/config.yaml
+# 此命令将只测试节点延迟，跳过其他测试项目，适用于：
+# - 快速检查节点是否可用
+# - 只需要检查延迟的场景
+# - 需要快速得到测试结果的场景
+🇭🇰 香港 HK-10 100% |██████████████████| (20/20, 13 it/min)
+序号    节点名称                类型            延迟
+1.      🇭🇰 香港 HK-01           Trojan          657ms
+2.      🇭🇰 香港 HK-20           Trojan          649ms
+3.      🇭🇰 香港 HK-15           Trojan          674ms
+4.      🇭🇰 香港 HK-19           Trojan          649ms
+5.      🇭🇰 香港 HK-12           Trojan          667ms
 
 ## 测速原理
 
@@ -90,4 +118,4 @@ Cloudflare 是全球知名的 CDN 服务商，其提供的测速服务器到海�
 
 ## License
 
-[MIT](LICENSE)
+[GPL-3.0](LICENSE)
